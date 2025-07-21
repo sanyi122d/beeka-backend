@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Body, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from ai_service import ask_ai, generate_notes, generate_quiz, generate_flashcards
 import os
@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import traceback
 from typing import List, Optional
 from datetime import datetime
+from firebase_auth import verify_firebase_token, firestore_client
 
 logging.basicConfig(level=logging.INFO)
 
@@ -22,6 +23,42 @@ load_dotenv()
 
 # Database setup
 DB_PATH = 'studybuddy.db'
+
+# Usage limits
+USAGE_LIMITS = {
+    'files_uploaded': 2,
+    'chat_messages': 5,
+    'notes_generated': 1,
+    'quizzes_generated': 1,
+    'flashcards_generated': 1,
+}
+
+def get_usage_doc(uid):
+    return firestore_client.collection('usage').document(uid)
+
+def get_user_usage(uid):
+    doc = get_usage_doc(uid).get()
+    if doc.exists:
+        return doc.to_dict()
+    else:
+        return {
+            'files_uploaded': 0,
+            'chat_messages': 0,
+            'notes_generated': 0,
+            'quizzes_generated': 0,
+            'flashcards_generated': 0,
+        }
+
+def increment_user_usage(uid, field):
+    usage_ref = get_usage_doc(uid)
+    usage_ref.set({field: firestore_client.field_value('increment', 1)}, merge=True)
+
+def check_and_increment_usage(uid, field):
+    usage = get_user_usage(uid)
+    if usage.get(field, 0) >= USAGE_LIMITS[field]:
+        return False, usage.get(field, 0)
+    increment_user_usage(uid, field)
+    return True, usage.get(field, 0) + 1
 
 @contextmanager
 def get_db():
@@ -92,10 +129,10 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://beeka.vercel.app"],  # or ["*"] for all, but restrict in production!
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True
 )
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -118,9 +155,23 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
         return "PDF_PROCESSING_ERROR"
 
 @app.post("/upload/{folder_id}")
-async def upload_file(folder_id: str, file: UploadFile = File(...)):
+async def upload_file(folder_id: str, file: UploadFile = File(...), Authorization: str = Header(None)):
     try:
-        logging.info(f"Received file: {file.filename} for folder: {folder_id}")
+        # Extract and verify Firebase token
+        if not Authorization or not Authorization.startswith("Bearer "):
+            raise HTTPException(401, "Missing or invalid Authorization header")
+        id_token = Authorization.split(" ", 1)[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            raise HTTPException(401, "Invalid Firebase token")
+        uid = decoded["uid"]
+
+        # Enforce file upload limit
+        allowed, used = check_and_increment_usage(uid, 'files_uploaded')
+        if not allowed:
+            raise HTTPException(403, f"File upload limit reached ({used}/{USAGE_LIMITS['files_uploaded']}) for free users.")
+
+        logging.info(f"Received file: {file.filename} for folder: {folder_id} (user: {uid})")
         
         # Verify folder exists
         with get_db() as conn:
@@ -265,11 +316,24 @@ async def ask_question(request: AIRequest):
         )
 
 @app.post("/generate-notes")
-async def generate_notes_endpoint(request: NotesRequest):
+async def generate_notes_endpoint(request: NotesRequest, Authorization: str = Header(None)):
     if not request.context.strip():
         raise HTTPException(400, "No content provided for generating notes")
-    
     try:
+        # Extract and verify Firebase token
+        if not Authorization or not Authorization.startswith("Bearer "):
+            raise HTTPException(401, "Missing or invalid Authorization header")
+        id_token = Authorization.split(" ", 1)[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            raise HTTPException(401, "Invalid Firebase token")
+        uid = decoded["uid"]
+
+        # Enforce note generation limit
+        allowed, used = check_and_increment_usage(uid, 'notes_generated')
+        if not allowed:
+            raise HTTPException(403, f"Note generation limit reached ({used}/{USAGE_LIMITS['notes_generated']}) for free users.")
+
         notes = await generate_notes(request.context)
         return {"notes": notes}
     except Exception as e:
@@ -285,9 +349,23 @@ class ChatRequest(BaseModel):
     context: str
 
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, Authorization: str = Header(None)):
     try:
-        logging.info(f"Received chat request: {request.message[:100]}...")
+        # Extract and verify Firebase token
+        if not Authorization or not Authorization.startswith("Bearer "):
+            raise HTTPException(401, "Missing or invalid Authorization header")
+        id_token = Authorization.split(" ", 1)[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            raise HTTPException(401, "Invalid Firebase token")
+        uid = decoded["uid"]
+
+        # Enforce chat message limit
+        allowed, used = check_and_increment_usage(uid, 'chat_messages')
+        if not allowed:
+            raise HTTPException(403, f"Chat message limit reached ({used}/{USAGE_LIMITS['chat_messages']}) for free users.")
+
+        logging.info(f"Received chat request: {request.message[:100]}... (user: {uid})")
         response = await ask_ai(request.message, request.context)
         logging.info("Successfully generated chat response")
         return {"response": response}
@@ -499,8 +577,22 @@ async def clear_all_data(user_id: str = "default"):
         raise HTTPException(500, f"Failed to clear data: {str(e)}")
 
 @app.post("/generate-quiz")
-async def generate_quiz_endpoint(request: Request):
+async def generate_quiz_endpoint(request: Request, Authorization: str = Header(None)):
     try:
+        # Extract and verify Firebase token
+        if not Authorization or not Authorization.startswith("Bearer "):
+            raise HTTPException(401, "Missing or invalid Authorization header")
+        id_token = Authorization.split(" ", 1)[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            raise HTTPException(401, "Invalid Firebase token")
+        uid = decoded["uid"]
+
+        # Enforce quiz generation limit
+        allowed, used = check_and_increment_usage(uid, 'quizzes_generated')
+        if not allowed:
+            raise HTTPException(403, f"Quiz generation limit reached ({used}/{USAGE_LIMITS['quizzes_generated']}) for free users.")
+
         # Parse request body
         body = await request.json()
         file_ids = body.get("file_ids", [])
@@ -543,8 +635,22 @@ async def generate_quiz_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate-flashcards")
-async def generate_flashcards_endpoint(request: Request):
+async def generate_flashcards_endpoint(request: Request, Authorization: str = Header(None)):
     try:
+        # Extract and verify Firebase token
+        if not Authorization or not Authorization.startswith("Bearer "):
+            raise HTTPException(401, "Missing or invalid Authorization header")
+        id_token = Authorization.split(" ", 1)[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            raise HTTPException(401, "Invalid Firebase token")
+        uid = decoded["uid"]
+
+        # Enforce flashcard generation limit
+        allowed, used = check_and_increment_usage(uid, 'flashcards_generated')
+        if not allowed:
+            raise HTTPException(403, f"Flashcard generation limit reached ({used}/{USAGE_LIMITS['flashcards_generated']}) for free users.")
+
         # Parse request body
         body = await request.json()
         file_ids = body.get("file_ids", [])
@@ -583,9 +689,23 @@ async def generate_flashcards_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/spaces/{space_id}/messages")
-async def add_message(space_id: str, message: ChatMessage):
+async def add_message(space_id: str, message: ChatMessage, Authorization: str = Header(None)):
     message_id = str(uuid.uuid4())
     try:
+        # Extract and verify Firebase token
+        if not Authorization or not Authorization.startswith("Bearer "):
+            raise HTTPException(401, "Missing or invalid Authorization header")
+        id_token = Authorization.split(" ", 1)[1]
+        decoded = verify_firebase_token(id_token)
+        if not decoded:
+            raise HTTPException(401, "Invalid Firebase token")
+        uid = decoded["uid"]
+
+        # Enforce chat message limit
+        allowed, used = check_and_increment_usage(uid, 'chat_messages')
+        if not allowed:
+            raise HTTPException(403, f"Chat message limit reached ({used}/{USAGE_LIMITS['chat_messages']}) for free users.")
+
         with get_db() as conn:
             # Verify space exists
             space = conn.execute(
@@ -652,6 +772,19 @@ async def delete_messages(space_id: str):
         logging.error(f"Failed to delete messages: {str(e)}")
         logging.error(traceback.format_exc())
         raise HTTPException(500, f"Failed to delete messages: {str(e)}")
+
+@app.get("/usage")
+async def get_usage(Authorization: str = Header(None)):
+    # Extract and verify Firebase token
+    if not Authorization or not Authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid Authorization header")
+    id_token = Authorization.split(" ", 1)[1]
+    decoded = verify_firebase_token(id_token)
+    if not decoded:
+        raise HTTPException(401, "Invalid Firebase token")
+    uid = decoded["uid"]
+    usage = get_user_usage(uid)
+    return {"usage": usage, "limits": USAGE_LIMITS}
 
 if __name__ == "__main__":
     import uvicorn
