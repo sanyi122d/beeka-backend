@@ -50,3 +50,4 @@ tqdm==4.67.1
 typing_extensions==4.13.2
 urllib3==2.4.0
 uvicorn==0.24.0
+firebase-admin==6.5.0
